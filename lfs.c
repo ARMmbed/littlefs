@@ -3214,14 +3214,8 @@ typedef int (*lfs_dir_prep_helper_t)(lfs_t *, struct lfs_remove_state *);
 static int lfs_dir_prep_remove_nonempty_folders(lfs_t *lfs, struct lfs_remove_state *p) {
     uint16_t id = 0;
 
-    int ret = 0;
-
     // Walk tags stored in this directory and check for any directory
-    // tags.  Removal of directories with a directory in them can lead
-    // to additional orphans in the filesystem, so we return
-    // LFS_ERR_NOTEMPTY in this case.  Otherwise, leave the loaded
-    // directory for the tail end of the directory split to leave a proper
-    // view of the filesystem after removal.
+    // tags.
     while(true) {
         if (p->dir.m.count == id) {
             if (!p->dir.m.split) {
@@ -3249,21 +3243,31 @@ static int lfs_dir_prep_remove_nonempty_folders(lfs_t *lfs, struct lfs_remove_st
         }
 
         if (lfs_tag_type3(tag) == LFS_TYPE_DIR) {
-            // We're not allowed to find leafs
+            // In case we are finding leafs, we need to update our tag, too,
+            // so that the upper routine knows where this folder was in the
+            // parent folder.  The parent routine will decide if we need
+            // to return LFS_ERR_NOTEMPTY all the way back out.
+            p->tag = tag;
             return LFS_ERR_NOTEMPTY;
         }
 
         id += 1;
     }
 
-    return ret;
+    return 0;
 }
 #endif
 
 #ifndef LFS_READONLY
+// Note: This returns 1 when it had to descend to find a leaf node,
+//       0 when it didn't have to descend.
 static int lfs_dir_prep_removal(lfs_t *lfs, struct lfs_remove_state *p,
-        lfs_dir_prep_helper_t helper) {
-    lfs_stag_t res = lfs_dir_get(lfs, &p->cwd, LFS_MKTAG(0x700, 0x3ff, 0),
+        lfs_dir_prep_helper_t helper, bool find_leaf) {
+    lfs_block_t depth = 0;
+    lfs_stag_t res;
+
+new_leaf:
+    res = lfs_dir_get(lfs, &p->cwd, LFS_MKTAG(0x700, 0x3ff, 0),
             LFS_MKTAG(LFS_TYPE_STRUCT, lfs_tag_id(p->tag), 8), p->dir_head);
     if (res < 0) {
         return (int)res;
@@ -3276,7 +3280,6 @@ static int lfs_dir_prep_removal(lfs_t *lfs, struct lfs_remove_state *p,
     }
 
     memset(&p->gstate, 0, sizeof(p->gstate));
-
     if (p->dir.m.count > 0 || p->dir.m.split) {
         // Normal POSIX behavior wouldn't allow a non-empty
         // folder to be removed/renamed into in this manner
@@ -3285,7 +3288,20 @@ static int lfs_dir_prep_removal(lfs_t *lfs, struct lfs_remove_state *p,
         }
 
         err = helper(lfs, p);
-        if (err) {
+        if (err == LFS_ERR_NOTEMPTY && find_leaf) {
+            if (depth++ > lfs->cfg->block_count / 2) {
+                return LFS_ERR_CORRUPT;
+            }
+
+            // Descend CWD
+            memcpy(&p->cwd, &p->dir.m, sizeof(p->cwd));
+
+            // And loop
+            goto new_leaf;
+        }
+
+        if (err)
+        {
             return err;
         }
     }
@@ -3302,7 +3318,7 @@ static int lfs_dir_prep_removal(lfs_t *lfs, struct lfs_remove_state *p,
     p->dir.id = 0;
     lfs->mlist = &p->dir;
 
-    return 0;
+    return depth != 0;
 }
 #endif
 
@@ -3334,42 +3350,61 @@ static int lfs_dir_finish_removal(lfs_t *lfs, struct lfs_remove_state *p)
 #endif
 
 #ifndef LFS_READONLY
-static int lfs_rawremove(lfs_t *lfs, const char *path, lfs_dir_prep_helper_t helper) {
+static int lfs_rawremove(lfs_t *lfs, const char *path, lfs_dir_prep_helper_t helper, bool recursive) {
+    // For the recursive flag to work, we must have the helper defined.
+    if (recursive && NULL == helper) {
+        return LFS_ERR_INVAL;
+    }
+
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
     if (err) {
         return err;
     }
 
+    bool at_toplevel = true;
     struct lfs_remove_state s;
-    s.tag = lfs_dir_find(lfs, &s.cwd, &path, NULL);
-    if (s.tag < 0 || lfs_tag_id(s.tag) == 0x3ff) {
-        return (s.tag < 0) ? (int)s.tag : LFS_ERR_INVAL;
-    }
-
-    s.dir.next = lfs->mlist;
-    if (lfs_tag_type3(s.tag) == LFS_TYPE_DIR) {
-        err = lfs_dir_prep_removal(lfs, &s, helper);
-        if (err < 0) {
-            return err;
+    do {
+        // Since we want to keep our in-memory usage minimal, we rely on
+        // the disk structure to "recurse".  We'll go back to the top
+        // level path every time we need to find a new leaf.  Technically
+        // we could remember the top-level path state so we don't have
+        // to search again for this folder entry...
+        at_toplevel = true;
+        s.tag = lfs_dir_find(lfs, &s.cwd, &path, NULL);
+        if (s.tag < 0 || lfs_tag_id(s.tag) == 0x3ff) {
+            return (s.tag < 0) ? (int)s.tag : LFS_ERR_INVAL;
         }
-    }
 
-    // delete the entry
-    err = lfs_dir_commit(lfs, &s.cwd, LFS_MKATTRS(
-            {LFS_MKTAG(LFS_TYPE_DELETE, lfs_tag_id(s.tag), 0), NULL}));
-    if (err) {
-        lfs->mlist = s.dir.next;
-        return err;
-    }
+        s.dir.next = lfs->mlist;
+        if (lfs_tag_type3(s.tag) == LFS_TYPE_DIR) {
+            err = lfs_dir_prep_removal(lfs, &s, helper, recursive);
+            if (err == 1) {
+                // We had to switch folders and we're no longer in the top-level folder.
+                // This means we need to go back from the top after we finish the
+                // removal process.
+                at_toplevel = false;
+            } else if (err < 0) {
+                return err;
+            }
+        }
 
-    lfs->mlist = s.dir.next;
-    if (lfs_tag_type3(s.tag) == LFS_TYPE_DIR) {
-        err = lfs_dir_finish_removal(lfs, &s);
+        // delete the entry
+        err = lfs_dir_commit(lfs, &s.cwd, LFS_MKATTRS(
+                {LFS_MKTAG(LFS_TYPE_DELETE, lfs_tag_id(s.tag), 0), NULL}));
         if (err) {
+            lfs->mlist = s.dir.next;
             return err;
         }
-    }
+
+        lfs->mlist = s.dir.next;
+        if (lfs_tag_type3(s.tag) == LFS_TYPE_DIR) {
+            err = lfs_dir_finish_removal(lfs, &s);
+            if (err) {
+                return err;
+            }
+        }
+    } while(!at_toplevel);
 
     return 0;
 }
@@ -3425,7 +3460,7 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath,
         return 0;
     } else if (lfs_tag_type3(n.tag) == LFS_TYPE_DIR) {
         // must be empty before removal to prevent orphans
-        err = lfs_dir_prep_removal(lfs, &n, helper);
+        err = lfs_dir_prep_removal(lfs, &n, helper, false);
         if (err) {
             return err;
         }
@@ -5065,9 +5100,25 @@ int lfs_remove(lfs_t *lfs, const char *path) {
     }
     LFS_TRACE("lfs_remove(%p, \"%s\")", (void*)lfs, path);
 
-    err = lfs_rawremove(lfs, path, NULL);
+    err = lfs_rawremove(lfs, path, NULL, false);
 
     LFS_TRACE("lfs_remove -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+int lfs_remove_recursive(lfs_t *lfs, const char *path) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_remove_recursive(%p, \"%s\")", (void*)lfs, path);
+
+    err = lfs_rawremove(lfs, path, lfs_dir_prep_remove_nonempty_folders, true);
+
+    LFS_TRACE("lfs_remove_recursive -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }
@@ -5083,7 +5134,7 @@ int lfs_atomic_remove(lfs_t *lfs, const char *path) {
 
     // Note: We pass in a helper pointer here so that this extra
     //       logic can be dropped if it is never referenced
-    err = lfs_rawremove(lfs, path, lfs_dir_prep_remove_nonempty_folders);
+    err = lfs_rawremove(lfs, path, lfs_dir_prep_remove_nonempty_folders, false);
 
     LFS_TRACE("lfs_atomic_remove -> %d", err);
     LFS_UNLOCK(lfs->cfg);
